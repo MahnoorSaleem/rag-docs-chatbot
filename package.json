@@ -1,0 +1,31 @@
+{
+  "name": "doc-chatbot",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "ingest": "tsx src/ingest.ts",
+    "rag": "tsx src/rag.ts",
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@llamaindex/chroma": "^0.0.36",
+    "@llamaindex/groq": "^0.0.94",
+    "@llamaindex/huggingface": "^0.1.32",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "llamaindex": "^0.12.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.9.1",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3"
+  }
+}
