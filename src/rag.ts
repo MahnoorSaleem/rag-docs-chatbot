@@ -1,6 +1,7 @@
 import { Groq } from "@llamaindex/groq";
 import {
   CompactAndRefine,
+  MetadataMode,
   PromptTemplate,
   Settings,
   VectorStoreIndex,
@@ -55,6 +56,23 @@ export async function ask(question: string): Promise<{ answer: string; sources: 
   return { answer: String(response.message.content), sources };
 }
 
+export async function inspect(question: string): Promise<void> {
+  const index = await getIndex();
+  const retriever = index.asRetriever({ similarityTopK: 5 });
+  const results = await retriever.retrieve({ query: question });
+
+  // console.log(`\nQuestion: "${question}"`);
+  // console.log(`Retrieved ${results.length} chunk(s):\n`);
+  results.forEach((r, i) => {
+    const score = r.score?.toFixed(3) ?? "n/a";
+    // const source = r.node.metadata?.source ?? "unknown";
+    // const text = r.node.getContent(MetadataMode.NONE).slice(0, 200).replace(/\n/g, " ");
+    const text = r.node.getContent(MetadataMode.NONE).slice(0, 100).replace(/\n/g, " ");
+    console.log(`  #${i + 1} score=${score} | "${text}"`);
+    // console.log(`       "${text}..."\n`);
+  });
+}
+
 // Smoke-test runner: `npm run rag`
 if (process.argv[1]?.endsWith("rag.ts")) {
   const questions = [
@@ -63,9 +81,9 @@ if (process.argv[1]?.endsWith("rag.ts")) {
     "What HTTP error codes exist?",
   ];
   for (const q of questions) {
-    console.log(`\nQ: ${q}`);
+    console.log(`\nQ: "${q}"`);
+    await inspect(q);
     const { answer, sources } = await ask(q);
-    console.log(`A: ${answer}`);
-    console.log(`Sources: ${sources.join(", ")}`);
+    console.log(`Answer: ${answer}`);
   }
 }

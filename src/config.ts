@@ -9,11 +9,11 @@ import { Settings } from "llamaindex";
 dotenv.config();
 
 Settings.embedModel = new HuggingFaceEmbedding({
-  modelType: HuggingFaceEmbeddingModelType.XENOVA_ALL_MINILM_L6_V2,
+  modelType: HuggingFaceEmbeddingModelType.XENOVA_ALL_MPNET_BASE_V2,
 });
 
 export const vectorStore = new ChromaVectorStore({
-  collectionName: "doc-chatbot",
+  collectionName: "doc-chatbot-v2",
   chromaClientParams: {
     path: process.env.CHROMA_URL ?? "http://localhost:8000",
   },
