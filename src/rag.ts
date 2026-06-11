@@ -6,13 +6,20 @@ import {
   Settings,
   VectorStoreIndex,
 } from "llamaindex";
+import { JinaAIReranker } from "llamaindex/postprocessors";
+import type { NodeWithScore } from "@llamaindex/core/schema";
+import { logger } from "./logger.js";
 import { vectorStore } from "./config.js";
+
+const ragLog = logger.child({ component: "rag" });
 
 Settings.llm = new Groq({
   model: "llama-3.1-8b-instant",
   temperature: 0,
   apiKey: process.env.GROQ_API_KEY,
 });
+
+const reranker = new JinaAIReranker({ topN: 5 });
 
 const qaTemplate = new PromptTemplate({
   templateVars: ["context", "query"],
@@ -39,15 +46,30 @@ async function getIndex(): Promise<VectorStoreIndex> {
   return cachedIndex;
 }
 
-export async function ask(question: string): Promise<{ answer: string; sources: string[] }> {
+export async function ask(
+  question: string,
+): Promise<{ answer: string; sources: string[] }> {
   const index = await getIndex();
 
-  const queryEngine = index.asQueryEngine({
-    retriever: index.asRetriever({ similarityTopK: 5 }),
-    responseSynthesizer: new CompactAndRefine({ textQATemplate: qaTemplate }),
-  });
+  let start = Date.now();
+  const retriever = index.asRetriever({ similarityTopK: 20 });
+  const candidates = await retriever.retrieve({ query: question });
+  ragLog.info(
+    { stage: "retrieve", count: candidates.length, ms: Date.now() - start },
+    "retrieved candidates",
+  );
 
-  const response = await queryEngine.query({ query: question });
+  start = Date.now();
+  const reranked = await reranker.postprocessNodes(candidates, question);
+  ragLog.info(
+    { stage: "rerank", count: reranked.length, ms: Date.now() - start },
+    "reranked candidates",
+  );
+
+  start = Date.now();
+  const synthesizer = new CompactAndRefine({ textQATemplate: qaTemplate });
+  const response = await synthesizer.synthesize({ query: question, nodes: reranked });
+  ragLog.info({ stage: "generate", ms: Date.now() - start }, "generated answer");
 
   const sources = (response.sourceNodes ?? [])
     .map((n) => n.node.metadata?.source as string)
@@ -56,21 +78,27 @@ export async function ask(question: string): Promise<{ answer: string; sources: 
   return { answer: String(response.message.content), sources };
 }
 
-export async function inspect(question: string): Promise<void> {
-  const index = await getIndex();
-  const retriever = index.asRetriever({ similarityTopK: 5 });
-  const results = await retriever.retrieve({ query: question });
-
-  // console.log(`\nQuestion: "${question}"`);
-  // console.log(`Retrieved ${results.length} chunk(s):\n`);
+function printRanked(label: string, results: NodeWithScore[]): void {
+  console.log(`  ${label}:`);
   results.forEach((r, i) => {
     const score = r.score?.toFixed(3) ?? "n/a";
-    // const source = r.node.metadata?.source ?? "unknown";
-    // const text = r.node.getContent(MetadataMode.NONE).slice(0, 200).replace(/\n/g, " ");
-    const text = r.node.getContent(MetadataMode.NONE).slice(0, 100).replace(/\n/g, " ");
-    console.log(`  #${i + 1} score=${score} | "${text}"`);
-    // console.log(`       "${text}..."\n`);
+    const text = r.node
+      .getContent(MetadataMode.NONE)
+      .slice(0, 100)
+      .replace(/\n/g, " ");
+    console.log(`    #${i + 1} score=${score} | "${text}"`);
   });
+}
+
+export async function inspect(question: string): Promise<void> {
+  const index = await getIndex();
+  const retriever = index.asRetriever({ similarityTopK: 20 });
+  const candidates = await retriever.retrieve({ query: question });
+
+  printRanked("Before rerank (top 5 by similarity)", candidates.slice(0, 5));
+
+  const reranked = await reranker.postprocessNodes(candidates, question);
+  printRanked("After rerank (top 5 by relevance)", reranked.slice(0, 5));
 }
 
 // Smoke-test runner: `npm run rag`

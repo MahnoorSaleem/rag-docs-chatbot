@@ -10,10 +10,13 @@ import { ChromaClient } from "chromadb";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { logger } from "./logger.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DOCS_PATH = path.join(__dirname, "../docs");
+
+const ingestLog = logger.child({ component: "ingest" });
 
 function stripMarkdown(text: string): string {
   return text
@@ -27,10 +30,12 @@ function stripMarkdown(text: string): string {
 }
 
 async function loadDocuments(dirPath: string): Promise<Document[]> {
+  const start = Date.now();
   const entries = await fs.readdir(dirPath, { withFileTypes: true });
+  const files = entries.filter((e) => e.isFile());
   const docs: Document[] = [];
 
-  for (const entry of entries.filter((e) => e.isFile())) {
+  for (const entry of files) {
     const filePath = path.join(dirPath, entry.name);
     const raw = await fs.readFile(filePath, "utf-8");
 
@@ -51,31 +56,45 @@ async function loadDocuments(dirPath: string): Promise<Document[]> {
     }
   }
 
+  ingestLog.info(
+    { stage: "load", files: files.length, sections: docs.length, ms: Date.now() - start },
+    "loaded documents",
+  );
+  docs.forEach((doc, i) => {
+    const preview = doc.text.split("\n")[0];
+    ingestLog.debug(
+      { stage: "load", index: i + 1, source: (doc.metadata as { source: string }).source, preview },
+      "section",
+    );
+  });
+
   return docs;
 }
 
 async function clearCollection() {
+  const start = Date.now();
   const client = new ChromaClient({ path: process.env.CHROMA_URL ?? "http://localhost:8000" });
   const collections = await client.listCollections();
-  if (collections.some((c: unknown) => (typeof c === "string" ? c : (c as any).name) === "doc-chatbot-v2")) {
+  const exists = collections.some(
+    (c: unknown) => (typeof c === "string" ? c : (c as any).name) === "doc-chatbot-v2",
+  );
+  if (exists) {
     await client.deleteCollection({ name: "doc-chatbot-v2" });
-    console.log("Cleared doc-chatbot-v2.");
   }
+  ingestLog.info(
+    { stage: "clear", cleared: exists, ms: Date.now() - start },
+    exists ? "cleared collection" : "no collection to clear",
+  );
 }
 
 async function main() {
   await clearCollection();
   const documents = await loadDocuments(DOCS_PATH);
 
-  console.log(`Split into ${documents.length} section(s)`);
-  documents.forEach((doc, i) => {
-    const preview = doc.text.split("\n")[0];
-    console.log(`  #${i + 1} [${(doc.metadata as any).source}] "${preview}"`);
-  });
-
+  const start = Date.now();
   const storageContext = await storageContextFromDefaults({ vectorStore });
   await VectorStoreIndex.init({ nodes: documents as unknown as BaseNode[], storageContext });
-  console.log("Done.");
+  ingestLog.info({ stage: "index", count: documents.length, ms: Date.now() - start }, "indexed documents");
 }
 
-main().catch(console.error);
+main().catch((err: unknown) => ingestLog.error({ err }, "ingest failed"));

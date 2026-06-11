@@ -19,7 +19,10 @@
     "@llamaindex/huggingface": "^0.1.32",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "llamaindex": "^0.12.1"
+    "llamaindex": "^0.12.1",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
+    "pino-pretty": "^13.1.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
