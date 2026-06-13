@@ -46,9 +46,9 @@ async function getIndex(): Promise<VectorStoreIndex> {
   return cachedIndex;
 }
 
-export async function ask(
+export async function retrieveAndRerank(
   question: string,
-): Promise<{ answer: string; sources: string[] }> {
+): Promise<{ candidates: NodeWithScore[]; reranked: NodeWithScore[] }> {
   const index = await getIndex();
 
   let start = Date.now();
@@ -66,7 +66,15 @@ export async function ask(
     "reranked candidates",
   );
 
-  start = Date.now();
+  return { candidates, reranked };
+}
+
+export async function ask(
+  question: string,
+): Promise<{ answer: string; sources: string[] }> {
+  const { reranked } = await retrieveAndRerank(question);
+
+  const start = Date.now();
   const synthesizer = new CompactAndRefine({ textQATemplate: qaTemplate });
   const response = await synthesizer.synthesize({ query: question, nodes: reranked });
   ragLog.info({ stage: "generate", ms: Date.now() - start }, "generated answer");
@@ -91,13 +99,9 @@ function printRanked(label: string, results: NodeWithScore[]): void {
 }
 
 export async function inspect(question: string): Promise<void> {
-  const index = await getIndex();
-  const retriever = index.asRetriever({ similarityTopK: 20 });
-  const candidates = await retriever.retrieve({ query: question });
+  const { candidates, reranked } = await retrieveAndRerank(question);
 
   printRanked("Before rerank (top 5 by similarity)", candidates.slice(0, 5));
-
-  const reranked = await reranker.postprocessNodes(candidates, question);
   printRanked("After rerank (top 5 by relevance)", reranked.slice(0, 5));
 }
 

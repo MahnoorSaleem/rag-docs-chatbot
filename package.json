@@ -7,6 +7,7 @@
     "start": "tsx src/server.ts",
     "ingest": "tsx src/ingest.ts",
     "rag": "tsx src/rag.ts",
+    "eval": "tsx src/eval.ts",
     "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
