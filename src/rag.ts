@@ -5,6 +5,7 @@ import {
   PromptTemplate,
   Settings,
   VectorStoreIndex,
+  type LLMEndEvent,
 } from "llamaindex";
 import { JinaAIReranker } from "llamaindex/postprocessors";
 import type { NodeWithScore } from "@llamaindex/core/schema";
@@ -75,9 +76,24 @@ export async function ask(
   const { reranked } = await retrieveAndRerank(question);
 
   const start = Date.now();
-  const synthesizer = new CompactAndRefine({ textQATemplate: qaTemplate });
-  const response = await synthesizer.synthesize({ query: question, nodes: reranked });
-  ragLog.info({ stage: "generate", ms: Date.now() - start }, "generated answer");
+  const usage: Record<string, number> = {};
+  const onLLMEnd = (event: CustomEvent<LLMEndEvent>) => {
+    const callUsage = (event.detail.response.raw as { usage?: Record<string, number> } | null)
+      ?.usage;
+    for (const [key, value] of Object.entries(callUsage ?? {})) {
+      usage[key] = (usage[key] ?? 0) + value;
+    }
+  };
+
+  Settings.callbackManager.on("llm-end", onLLMEnd);
+  let response;
+  try {
+    const synthesizer = new CompactAndRefine({ textQATemplate: qaTemplate });
+    response = await synthesizer.synthesize({ query: question, nodes: reranked });
+  } finally {
+    Settings.callbackManager.off("llm-end", onLLMEnd);
+  }
+  ragLog.info({ stage: "generate", ms: Date.now() - start, usage }, "generated answer");
 
   const sources = (response.sourceNodes ?? [])
     .map((n) => n.node.metadata?.source as string)
