@@ -1,14 +1,14 @@
 # doc-chatbot
 
-A RAG (Retrieval-Augmented Generation) chatbot that answers questions about your own documentation — no fine-tuning, no paid embeddings API, no managed vector database required.
+A RAG (Retrieval-Augmented Generation) chatbot that answers questions about your own documentation: no fine-tuning, no paid embeddings API, no managed vector database required.
 
 ## Why I built this
 
-LLMs are great at language but blind to your private docs. The naive fix — pasting the whole document into the prompt — breaks down quickly: token limits, cost, and the model attending to irrelevant sections all degrade answer quality.
+LLMs are great at language but blind to your private docs. The naive fix, paste the whole document into the prompt, falls apart quickly: token limits, cost, and the model getting distracted by irrelevant sections all hurt answer quality.
 
-RAG solves this properly: embed your docs into a vector store at ingest time, then at query time retrieve only the relevant chunks and hand them to the model with the question. The model never needs to "know" the docs; it just synthesizes from what retrieval hands it.
+RAG is the better fix: embed your docs into a vector store at ingest time, then at query time retrieve only the relevant chunks and hand those to the model along with the question. The model doesn't need to "know" the docs, it just has to synthesize an answer from what retrieval gives it.
 
-This project is a focused implementation of that pattern using fully local embeddings and a self-hosted vector store, so the only external dependency is the inference API.
+This is a fairly minimal implementation of that pattern, using local embeddings and a self-hosted vector store so the only external dependency is the inference API (and the reranker).
 
 ## How it works
 
@@ -20,10 +20,12 @@ user question  →   rag.ts   →  top-20 candidates  →  Jina rerank  →  top
                              server.ts (POST /chat)
 ```
 
-1. **Ingest** — reads every file in `docs/`, splits it into 256-token chunks with 50-token overlap, embeds each chunk with a local HuggingFace model, and stores the vectors in ChromaDB.
-2. **Retrieve** — on each question, cosine-similarity search returns the top-20 candidate chunks, which a Jina AI reranker re-scores against the question and narrows to the top 5.
-3. **Generate** — the chunks are passed to Groq's LLaMA 3.1 8B with a strict system prompt: answer only from context, cite the source file.
-4. **Serve** — an Express server exposes `POST /chat` wrapping steps 2–3.
+1. **Ingest**: reads every file in `docs/`, splits it into 256-token chunks with 50-token overlap, embeds each chunk with a local HuggingFace model, and stores the vectors in ChromaDB.
+2. **Retrieve**: on each question, cosine-similarity search returns the top-20 candidate chunks, which a Jina AI reranker re-scores against the question and narrows to the top 5.
+3. **Generate**: the chunks are passed to Groq's LLaMA 3.1 8B with a strict system prompt: answer only from context, cite the source file.
+4. **Serve**: an Express server exposes `POST /chat` wrapping steps 2–3, plus `POST /feedback` for rating answers.
+
+Every stage logs its own latency/counts, and there's a separate offline script for checking retrieval quality with an LLM judge (see [Evaluation](#evaluation) below).
 
 ## Stack
 
@@ -34,43 +36,64 @@ user question  →   rag.ts   →  top-20 candidates  →  Jina rerank  →  top
 | Embeddings | HuggingFace `all-MiniLM-L6-v2` via ONNX (local) |
 | Reranker | Jina AI Reranker (`jina-reranker-v1-base-en`) |
 | Vector store | ChromaDB (self-hosted) |
-| LLM | Groq API — `llama-3.1-8b-instant` |
+| LLM | Groq API, `llama-3.1-8b-instant` |
 | HTTP server | Express 5 |
 | Logging | pino + pino-http (structured, pretty-printed in dev) |
 
 ## Architecture decisions
 
-**Local embeddings over an API**
-`all-MiniLM-L6-v2` runs locally via ONNX through LlamaIndex's HuggingFace integration. Ingestion can re-embed freely without per-call cost, and no document text leaves the machine. At 384 dimensions it's compact and fast. The tradeoff is a cold-start delay the first time the ONNX runtime loads the model weights — subsequent calls are fast.
+A few notes on the choices that weren't obvious, in case future-me (or you) wonders why something is the way it is.
 
-**Reranking the candidate set**
-Cosine similarity over embeddings is a coarse relevance signal — it ranks by vector-space proximity, which doesn't always line up with what's actually relevant to the question. Retrieving a wider candidate set (top-20) and passing it through a Jina AI reranker, which scores each chunk directly against the question text, produces a noticeably more relevant top-5 than similarity search alone — at the cost of one extra API call per query.
+**Local embeddings, not an API.** `all-MiniLM-L6-v2` runs locally via ONNX through LlamaIndex's HuggingFace integration. That means ingestion can be re-run as many times as needed without per-call cost, and document text never leaves the machine. 384 dimensions is small enough to be fast. The only annoying part is a cold-start delay the first time ONNX loads the model weights; every call after that is quick.
 
-**ChromaDB over Pinecone / Weaviate**
-Self-hosted with one Docker command, no account, data stays local. LlamaIndex has a first-class integration. The alternative of an in-memory FAISS index would lose all vectors on restart; Pinecone or Qdrant cloud would add external state. ChromaDB hits the right point on that tradeoff for a dev project.
+**Rerank the candidate set.** Cosine similarity is a coarse signal: it ranks by vector-space proximity, which doesn't always match what's actually relevant to the question. So retrieval pulls a wider net (top-20) and a Jina reranker, which scores each chunk directly against the question text, narrows that down to the top 5. Costs one extra API call per query but the top-5 is noticeably better than similarity search alone.
 
-**Groq for inference**
-Fast inference on LLaMA 3.1 8B with a generous free tier. For Q&A over retrieved context, a small-but-fast model beats a large-but-slow one — the retrieval step has already narrowed the problem to a short context window. The model's job is synthesis, not world knowledge.
+**ChromaDB over Pinecone/Weaviate.** Mostly a "keep it simple" call: one Docker command, no account, data stays on disk, and LlamaIndex has a first-class integration. An in-memory FAISS index would lose everything on restart, and a cloud vector DB adds external state I didn't want for a dev project.
 
-**`CompactAndRefine` response synthesizer**
-LlamaIndex offers several ways to combine multiple retrieved chunks into one answer. `Refine` calls the LLM once per chunk (slow, expensive for short answers). `CompactAndRefine` packs all chunks into a single LLM call when they fit, and only falls back to multi-step refinement when the combined context is too long. That keeps latency and cost low for typical queries.
+**Groq for inference.** Fast, generous free tier, and honestly for this use case a small-but-fast model beats a large-but-slow one, since retrieval has already narrowed things down to a short context, so the model's job is synthesis, not deep reasoning.
 
-**Chunk size 256 / overlap 50**
-Smaller chunks improve retrieval precision — each chunk covers one concept rather than a whole section, so a top-5 retrieval is more focused. The 50-token overlap prevents an answer from being split across a chunk boundary and lost. 256 tokens is large enough to include enough context around a fact, small enough to stay precise.
+**`CompactAndRefine` as the response synthesizer.** LlamaIndex has a few ways to turn multiple chunks into one answer. `Refine` calls the LLM once per chunk, which is slow and wasteful for short answers. `CompactAndRefine` packs everything into a single call when it fits and only falls back to multi-step refinement if the context is too big. Keeps latency down for the typical case.
 
-**Index caching in the server**
-`VectorStoreIndex.fromVectorStore()` fetches index metadata from ChromaDB on every call. Running it on each incoming request adds round-trip latency and unnecessary load. A module-level cache (`cachedIndex ??= await ...`) pays the initialization cost once on the first request and reuses the index for everything after.
+**Chunk size 256, overlap 50.** Smaller chunks = better retrieval precision, since each chunk is roughly one concept instead of a whole section. The 50-token overlap is there so an answer that straddles a chunk boundary doesn't get cut in half.
 
-**Structured logging: system level vs component level**
-A single log line per request ("got a question", "sent an answer") tells you *that* something happened but not *where* the time went or what failed inside. Two layers cover both: `pino-http` middleware logs one line per HTTP request/response (method, status, latency, request id) — the system-level view. Inside the pipeline, a `logger.child({ component: "rag" })` instance logs each stage (retrieve, rerank, generate) separately with its own count and duration — the component-level view needed to see *why* a request was slow or *where* it failed. `ingest.ts` follows the same pattern for its own stages (clear, load, index).
+**Index caching in the server.** `VectorStoreIndex.fromVectorStore()` hits ChromaDB for metadata every time it's called. Doing that per-request adds latency for no reason, so there's a module-level `cachedIndex ??= await ...` that pays the setup cost once and reuses the index after that.
+
+**Structured logging, system + component level.** A single "got a question, sent an answer" log line tells you *that* something happened but not *where* the time went. So there are two layers: `pino-http` logs one line per HTTP request (status, latency, request id), the system view, and a `logger.child({ component: "rag" })` inside the pipeline logs each stage (retrieve, rerank, generate) with its own count and duration, the component view. `ingest.ts` does the same for its stages.
+
+## Evaluation
+
+Logging tells you a request was slow or errored, but not whether the *answer* was actually good. For that I'm using a small evaluation framework with two axes: **scope** (component vs. system) and **evaluator type** (code-based, LLM-as-judge, human feedback).
+
+| | Code-based | LLM-as-judge | Human feedback |
+|---|---|---|---|
+| **Component** (retrieval) | retrieve/rerank latency, logged in `rag.ts` | context quality via `npm run eval` | not implemented (too high-friction) |
+| **System** (whole request) | token usage, logged in `rag.ts` | citation accuracy, not yet, planned as an `eval.ts` extension | thumbs up/down via `POST /feedback` |
+
+### Context quality (`npm run eval`)
+
+An offline script (`src/eval.ts`) that runs a fixed set of test questions through the real retrieve→rerank pipeline, then asks the LLM to score 1–5 whether the retrieved context actually contains enough to answer the question:
+
+```bash
+npm run eval
+```
+
+This runs against the live ChromaDB index, so re-run it after re-ingesting or changing the chunking/reranking config to catch retrieval regressions. It's deliberately offline rather than live, since judging every `/chat` request would double the LLM calls (and the latency) on the hot path.
+
+### Token usage
+
+Every `generated answer` log line from `rag.ts` includes the token usage Groq returns (`prompt_tokens`, `completion_tokens`, `total_tokens`, plus Groq's timing breakdown), summed across any internal refine calls. This was previously discarded, and it's useful for cost tracking without any extra calls.
+
+### Thumbs up / down feedback
+
+`/chat` returns a `requestId` (the pino-http request id). The client can later call `/feedback` with that id and a rating, and it gets logged correlated to the original request (see [API](#api) below).
 
 ## Challenges
 
-**ESM + TypeScript with LlamaIndex**
-LlamaIndex is ESM-first, which means `"type": "module"` in `package.json`, `moduleResolution: "nodenext"` in `tsconfig.json`, and `.js` extensions in all internal imports — even though the source files are `.ts`. TypeScript's ESM rules require that: the compiler rewrites `.ts → .js` but the import path in source must already say `.js`. Getting this right took a few `require is not defined` and `ERR_MODULE_NOT_FOUND` errors to shake out.
+**ESM + TypeScript with LlamaIndex.** LlamaIndex is ESM-first, which means `"type": "module"` in `package.json`, `moduleResolution: "nodenext"` in `tsconfig.json`, and `.js` extensions on every internal import, even though the source files are `.ts`. TypeScript's ESM rules say the compiler rewrites `.ts → .js`, but the import path in source has to already say `.js`. Took a few `require is not defined` / `ERR_MODULE_NOT_FOUND` errors before that clicked.
 
-**Shared setup without duplication**
-Both the ingest and query pipelines need the same embed model configuration and ChromaDB connection. The naive approach copies the setup into each file. I factored it into `src/config.ts`, which calls `dotenv.config()` and configures `Settings.embedModel` as module-level side effects. Because ES module imports are resolved before the importing file's body runs, config.ts executes first — so `process.env.*` is populated by the time any other module needs it.
+**Shared setup without duplication.** Both ingest and query need the same embed model config and ChromaDB connection. I factored that into `src/config.ts`, which runs `dotenv.config()` and sets `Settings.embedModel` as module-level side effects. Because ES module imports are resolved before the importing file's body runs, `config.ts` always executes first, so `process.env.*` is populated by the time anything else needs it.
+
+**`PromptTemplate` and literal braces.** While writing the LLM-judge prompt for `eval.ts`, I used LlamaIndex's `PromptTemplate` and asked the model to respond with a JSON object like `{"score": ..., "reasoning": ...}`. Turns out `PromptTemplate.format()` treats *any* `{...}` in the template as a placeholder to fill, including that literal JSON example, and throws "Replacement index out of range". Switched to a plain template literal for that prompt; `PromptTemplate` is really meant for templates whose only braces are actual variables.
 
 ## Prerequisites
 
@@ -107,7 +130,7 @@ LOG_LEVEL="info"
 
 ### 1. Add your docs
 
-Place `.md` or plain-text files in `docs/`. The existing files are sample docs — replace or extend them.
+Place `.md` or plain-text files in `docs/`. The existing files are sample docs, replace or extend them.
 
 ### 2. Ingest
 
@@ -134,8 +157,17 @@ curl -s -X POST http://localhost:3000/chat \
 ```json
 {
   "answer": "To install the package, run `npm install mypackage`...",
-  "sources": ["getting-started.md"]
+  "sources": ["getting-started.md"],
+  "requestId": 1
 }
+```
+
+### 5. (Optional) Send feedback on an answer
+
+```bash
+curl -s -X POST http://localhost:3000/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"requestId": 1, "rating": "up"}'
 ```
 
 ### Run the RAG pipeline directly (no server)
@@ -146,19 +178,27 @@ npm run rag
 
 Runs a set of hardcoded test questions against ChromaDB and prints answers to stdout. Useful for smoke-testing after a re-ingest. Also prints a before/after comparison of the candidate ranking pre- and post-rerank via `inspect()`.
 
+### Run the retrieval-quality eval
+
+```bash
+npm run eval
+```
+
+See [Evaluation](#evaluation) above.
+
 ## Logging & Observability
 
 Logging uses [pino](https://getpino.io), pretty-printed in dev via `pino-pretty`, at two levels:
 
-- **System level** — `pino-http` middleware in `server.ts` logs one line per HTTP request/response (method, URL, status code, response time, request id).
-- **Component level** — `rag.ts`, `ingest.ts`, and `server.ts` each get a child logger via `logger.child({ component: "..." })`. Inside `ask()`, every pipeline stage (retrieve, rerank, generate) logs its own candidate count and duration, so a slow or failing request can be traced to a specific stage rather than just "the request took 2s" or "it errored".
+- **System level**: `pino-http` middleware in `server.ts` logs one line per HTTP request/response (method, URL, status code, response time, request id).
+- **Component level**: `rag.ts`, `ingest.ts`, and `server.ts` each get a child logger via `logger.child({ component: "..." })`. Inside `ask()`, every pipeline stage (retrieve, rerank, generate) logs its own candidate count, duration, and, for `generate`, token usage, so a slow or failing request can be traced to a specific stage.
 
 Example output for a single `/chat` request:
 
 ```
 [INFO] retrieved candidates   component=rag   stage=retrieve count=20 ms=45
 [INFO] reranked candidates    component=rag   stage=rerank   count=5  ms=320
-[INFO] generated answer       component=rag   stage=generate          ms=890
+[INFO] generated answer       component=rag   stage=generate ms=890  usage={"prompt_tokens":593,"completion_tokens":58,"total_tokens":651,...}
 [INFO] answered question      component=chat  question="..." sources=[...] ms=1255
 [INFO] request completed      req={...} res={"statusCode":200} responseTime=1257
 ```
@@ -174,8 +214,9 @@ doc-chatbot/
 │   ├── config.ts       # Shared: dotenv, embed model, ChromaDB connection
 │   ├── logger.ts       # Shared pino logger instance
 │   ├── ingest.ts       # Load docs → chunk → embed → store in ChromaDB
-│   ├── rag.ts          # Retrieve → rerank → generate; exports ask() and inspect()
-│   └── server.ts       # Express server with POST /chat
+│   ├── rag.ts          # Retrieve → rerank → generate; exports ask(), inspect(), retrieveAndRerank()
+│   ├── eval.ts          # Offline LLM-as-judge eval for context quality (npm run eval)
+│   └── server.ts       # Express server with POST /chat and POST /feedback
 ├── .env
 ├── package.json
 └── tsconfig.json
@@ -192,11 +233,23 @@ doc-chatbot/
 ```json
 {
   "answer": "string",
-  "sources": ["filename.md"]
+  "sources": ["filename.md"],
+  "requestId": 1
 }
 ```
 
 | Status | Meaning |
 |---|---|
 | `400` | `question` missing or empty |
-| `500` | Internal error — check server logs |
+| `500` | Internal error, check server logs |
+
+### `POST /feedback`
+
+**Body:** `{ "requestId": 1, "rating": "up" | "down" }`
+
+Logs the rating correlated to the original `/chat` request (by `requestId`). Returns `204` with no body on success.
+
+| Status | Meaning |
+|---|---|
+| `204` | Feedback recorded |
+| `400` | `requestId` missing or `rating` is not `"up"`/`"down"` |
